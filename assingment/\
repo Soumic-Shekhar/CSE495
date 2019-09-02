@@ -1,0 +1,363 @@
+#pytorch docmumentation and seq2seq translation
+
+from __future__ import unicode_literals, print_function, division
+from io import open
+import unicodedata
+import string
+import re
+import random
+
+import torch
+import torch.nn as nn
+from torch import optim
+import torch.nn.functional as F
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class language:
+    def __init__(self, name):
+        self.name = name
+        self.word_index = {}
+        self.word_freq = {}
+        self.index2word = {0 : "SOS", 1 : "EOS"}
+        self.word_count = 2
+
+    def addSentence(self, sentence):
+        for word in sentence.split(' '):
+            self.addWord(word)
+
+    def addWord(self, word):
+        if word not in self.word_index:
+            self.word_index[word] = self.word_count
+            self.word_freq[word] = 1
+            self.index2word[self.word_count] = word
+            self.word_count += 1
+
+        else:
+            self.word_count += 1
+
+def normalizeString(s):
+
+    #if lang == 'en':
+    s = unicodeToAscii(s.lower().strip())
+    s = re.sub(r"([.!?])", r" \1", s)
+    s = re.sub(r"[^a-zA-Z.!?]+", r" ", s)
+    return s
+
+def unicodeToAscii(s):
+        return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+
+
+#self
+
+def readLangs():
+    
+    lines = open('data/en-bn.txt', encoding = 'utf-8').read().strip().split('।')
+
+    for i in range(len(lines)):
+        lines[i] = lines[i] + ('।')
+    # Split every line into pairs and normalize
+    #for l in lines:
+
+
+    pairs = [l.split('\n') for l in lines]
+    #print(lines[:10])
+    
+    for p in pairs:
+        for s in p:
+            if s == '':
+                p.remove(s)
+        
+    length = (len(pairs))
+    p = 0
+    while p < length: 
+        if len(pairs[p]) != 2:
+            pairs.pop(p)
+            length -= 1
+            p += 1
+        
+        else:            
+            temp = ''
+            for s in pairs[p][0]:
+                if s == ' ':temp = temp + ' '
+                temp = temp + normalizeString(s)
+            pairs[p][0] = temp
+            p += 1
+
+    input_lang = language('en')
+    output_lang = language('bn')
+
+    return input_lang, output_lang, pairs
+
+MAX_LENGTH = 100
+
+def prepareData():
+    input_lang, output_lang, pairs = readLangs()
+    print("Read %s sentence pairs" % len(pairs))
+    print("Trimmed to %s sentence pairs" % len(pairs))
+    print("Counting words...")
+    for pair in pairs:
+        input_lang.addSentence(pair[0])
+        output_lang.addSentence(pair[1])
+    print("Counted words:")
+    print(input_lang.name, input_lang.word_count)
+    print(output_lang.name, output_lang.word_count)
+    return input_lang, output_lang, pairs
+
+
+input_lang, output_lang, pairs = prepareData()
+print(random.choice(pairs))
+
+class EncoderRNN(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(EncoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+
+        self.embedding = nn.Embedding(input_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size)
+
+    def forward(self, input, hidden):
+        embedding = self.embedding(input).view(1, 1, -1)
+        output, hidden = self.gru(embedding, hidden)
+        return output, hidden
+
+    def initHidden(self):
+        return torch.zeros(1, 1, self.hidden_size, device=device)
+
+
+class AttnDecoderRNN(nn.Module):
+    def __init__(self, hidden_size, output_size, dropout_p=0.1, max_length=MAX_LENGTH):
+        super(AttnDecoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.dropout_p = dropout_p
+        self.max_length = max_length
+
+        self.embedding = nn.Embedding(self.output_size, self.hidden_size)
+        self.attn = nn.Linear(self.hidden_size * 2, self.max_length)
+        self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        self.dropout = nn.Dropout(self.dropout_p)
+        self.gru = nn.GRU(self.hidden_size, self.hidden_size)
+        self.out = nn.Linear(self.hidden_size, self.output_size)
+
+    def forward(self, input, hidden, encoder_outputs):
+        embedded = self.embedding(input).view(1, 1, -1)
+        embedded = self.dropout(embedded)
+
+        attn_weights = F.softmax(
+            self.attn(torch.cat((embedded[0], hidden[0]), 1)), dim=1)
+        attn_applied = torch.bmm(attn_weights.unsqueeze(0),
+                                 encoder_outputs.unsqueeze(0))
+
+        output = torch.cat((embedded[0], attn_applied[0]), 1)
+        output = self.attn_combine(output).unsqueeze(0)
+
+        output = F.relu(output)
+        output, hidden = self.gru(output, hidden)
+
+        output = F.log_softmax(self.out(output[0]), dim=1)
+        return output, hidden, attn_weights
+
+    def initHidden(self):
+        return torch.zeros(1, 1, self.hidden_size, device=device)
+
+
+class Discriminator(nn.Module):
+    def __init__(self, hidden_size, output_size):
+        super(Discriminator, self).__init__()
+
+        self.hidden = nn.Sequential(nn.Linear(hidden_size, 30), nn.LeakeyReLU(0.2))
+        self.out = nn.Sequential(nn.Linear(30, output_size), nn.Sigmoid())
+
+    def forward(self, embedding):
+        hidden_out = self.hidden(embedding)
+        output = self.out(hidden_out)
+        return output
+
+
+SOS_token = 0
+EOS_token = 1
+
+def indexesFromSentence(lang, sentence):
+    return [lang.word_index[word] for word in sentence.split(' ')]
+
+def tensorFromSentence(lang, sentence, noiseActivation):
+    indexes = indexesFromSentence(lang, sentence)
+    print(indexes)
+    indexes.append(EOS_token)
+    return torch.tensor(indexes, dtype=torch.long, device=device).view(-1, 1)
+
+def addNoise(sentence):
+    drop_index = random.randint(0, len(sentence))
+    return sentence.pop(drop_index)
+
+def tensorsFromPair(pair, noiseActivation):
+    input_tensor = tensorFromSentence(input_lang, pair[0], noiseActivation)
+    target_tensor = tensorFromSentence(output_lang, pair[1], 0)
+    return (input_tensor, target_tensor)
+
+teacher_forcing_ratio = 0.5
+
+def encode(input_length, input_tensor, encoder_hidden, output):
+    for x in range(input_length):
+        encoder_output, encoder_hidden = encoder(input_tensor[x], encoder_hidden)
+        output[x] = encoder_output[0,0]
+    return output, encoder_hidden
+
+
+def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, max_length = MAX_LENGTH):
+    encoder_hidden = encoder.initHidden()
+
+    encoder_optimizer.zero_grad()
+    decoder_optimizer.zero_grad()
+    decriminator_optimizer.zero_grad()
+
+    input_length = input_tensor.size(0)
+    target_length = target_tensor.zise(0)
+
+    enEmb = torch.zeros(max_length, encoder.hidden_size, device = device)
+    bnEmb = torch,zeros(max_length, encoder.hidden_size, device = device)
+
+    loss = 0
+
+    for ei in range(input_length):
+        encoder_output, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
+        encoder_output[ei] = encoder_output[0,0]
+
+    decoder_input = torch.tensor([[SOS_token]], device=device)
+    decoder_hidden = encoder_hidden
+
+    use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
+
+    if use_teacher_forcing:
+        for di in range(target_tensor):
+            decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input, decoder_hidden, encoder_outputs)
+            loss += criterion(decoder_output, target_tensor[di])
+            decoder_input = target_tensor[di]  # Teacher forcing
+        
+    else:
+        
+        # Without teacher forcing: use its own predictions as the next input
+        
+        for di in range(target_length):
+            decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input, decoder_hidden, encoder_outputs)
+            topv, topi = decoder_output.topk(1)
+            decoder_input = topi.squeeze().detach()  # detach from history as input
+            loss += criterion(decoder_output, target_tensor[di])
+
+            if decoder_input.item() == EOS_token:
+                break
+        
+        loss.backward()
+        encoder_optimizer.step()
+        decoder_optimizer.step()
+
+        return loss.item() / target_length
+
+import time
+import math
+
+
+def asMinutes(s):
+    m = math.floor(s / 60)
+    s -= m * 60
+    return '%dm %ds' % (m, s)
+
+
+def timeSince(since, percent):
+    now = time.time()
+    s = now - since
+    es = s / (percent)
+    rs = es - s
+    return '%s (- %s)' % (asMinutes(s), asMinutes(rs))
+
+
+
+def trainIters(encoder, decoder, n_iters, print_every=10, learning_rate=0.01, noiseRatio = 0.3):
+    start = time.time()
+    #plot_losses = []
+    print_loss_total = 0  # Reset every print_every
+
+    encoder_optimizer = optim.SGD(encoder.parameters(), lr=learning_rate)
+    decoder_optimizer = optim.SGD(decoder.parameters(), lr=learning_rate)
+        
+    '''
+    training_pairs = [tensorsFromPair(random.choice(pairs))
+                      for i in range(n_iters)]
+    '''
+
+    for i in range(n_iters):
+        if random.random() < noiseRatio:
+            training_pairs = tensorsFromPair(random.choice(pairs), 1)
+        
+        else:
+            training_pairs = tensorsFromPair(random.choice(pairs), 0)
+        
+    criterion = nn.NLLLoss()
+
+    for iter in range(1, n_iters + 1):
+        training_pair = training_pairs[iter - 1]
+        input_tensor = training_pair[0]
+        target_tensor = training_pair[1]
+
+        loss = train(input_tensor, target_tensor, encoder,
+                     decoder, encoder_optimizer, decoder_optimizer, criterion)
+        print_loss_total += loss
+        plot_loss_total += loss
+
+        if iter % print_every == 0:
+            print_loss_avg = print_loss_total / print_every
+            print_loss_total = 0
+            print('%s (%d %d%%) %.4f' % (timeSince(start, iter / n_iters), iter, iter / n_iters * 100, print_loss_avg))
+                        
+            torch.save({'epoch': epoch, 'model_state_dict': decoder.state_dict(), 'optimizer_state_dict': decoder_optimizer.state_dict(), 'loss': loss}, '')
+
+hidden_size = 256
+encoder1 = EncoderRNN(input_lang.word_count, hidden_size).to(device)
+attn_decoder1 = AttnDecoderRNN(hidden_size, output_lang.word_count, dropout_p=0.1).to(device)
+
+trainIters(encoder1, attn_decoder1, 75000)
+
+
+def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
+    with torch.no_grad():
+        input_tensor = tensorFromSentence(input_lang, sentence)
+        input_length = input_tensor.size()[0]
+        encoder_hidden = encoder.initHidden()
+
+        encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
+
+        for ei in range(input_length):
+            encoder_output, encoder_hidden = encoder(input_tensor[ei],
+                                                     encoder_hidden)
+            encoder_outputs[ei] += encoder_output[0, 0]
+
+        decoder_input = torch.tensor([[SOS_token]], device=device)  # SOS
+
+        decoder_hidden = encoder_hidden
+
+        decoded_words = []
+        decoder_attentions = torch.zeros(max_length, max_length)
+
+        for di in range(max_length):
+            decoder_output, decoder_hidden, decoder_attention = decoder(
+                decoder_input, decoder_hidden, encoder_outputs)
+            decoder_attentions[di] = decoder_attention.data
+            topv, topi = decoder_output.data.topk(1)
+            if topi.item() == EOS_token:
+                decoded_words.append('<EOS>')
+                break
+            else:
+                decoded_words.append(output_lang.index2word[topi.item()])
+
+            decoder_input = topi.squeeze().detach()
+
+        return decoded_words, decoder_attentions[:di + 1]
+
+
+
+
+
+
+
